@@ -118,7 +118,7 @@
         total-loans: u0,
         successful-repayments: u0,
         skill-score: u0,
-        last-verification: block-height,
+        last-verification: u0,
         is-active: true
       }
     )
@@ -154,7 +154,7 @@
         score: score,
         verified: true,
         verifier: oracle,
-        verification-date: block-height,
+        verification-date: u0,
         decay-factor: u100
       }
     )
@@ -224,7 +224,7 @@
         term-blocks: term-blocks,
         collateral-skills: collateral-skills,
         status: "active",
-        created-at: block-height,
+        created-at: u0,
         repaid-amount: u0,
         income-share-rate: income-share-rate
       }
@@ -279,7 +279,9 @@
               { user: borrower }
               (merge profile { 
                 successful-repayments: (+ (get successful-repayments profile) u1),
-                reputation-score: (min u1000 (+ (get reputation-score profile) u10))
+                reputation-score: (if (> (+ (get reputation-score profile) u10) u1000)
+                                      u1000
+                                      (+ (get reputation-score profile) u10))
               })
             )
           )
@@ -294,7 +296,7 @@
 ;; Apply skill decay
 (define-public (apply-skill-decay (user principal) (skill-name (string-ascii 50)))
   (let ((skill (unwrap! (map-get? skills { user: user, skill-name: skill-name }) err-not-found)))
-    (asserts! (> (- block-height (get verification-date skill)) u2016) err-invalid-input) ;; ~2 weeks
+    (asserts! (> (- u0 (get verification-date skill)) u2016) err-invalid-input) ;; ~2 weeks
     
     (let ((decayed-score (/ (* (get score skill) (- u100 skill-decay-rate)) u100)))
       (map-set skills
@@ -306,5 +308,69 @@
       )
     )
     (ok true)
+  )
+)
+
+;; read only functions
+
+;; Get user profile
+(define-read-only (get-user-profile (user principal))
+  (map-get? user-profiles { user: user })
+)
+
+;; Get skill info
+(define-read-only (get-skill (user principal) (skill-name (string-ascii 50)))
+  (map-get? skills { user: user, skill-name: skill-name })
+)
+
+;; Get loan details
+(define-read-only (get-loan (loan-id uint))
+  (map-get? loans { loan-id: loan-id })
+)
+
+;; Get vouch info
+(define-read-only (get-vouch (voucher principal) (borrower principal))
+  (map-get? vouches { voucher: voucher, borrower: borrower })
+)
+
+;; Get current loan ID
+(define-read-only (get-next-loan-id)
+  (var-get next-loan-id)
+)
+
+;; Get platform statistics
+(define-read-only (get-platform-stats)
+  {
+    total-loans-issued: (var-get total-loans-issued),
+    total-repaid: (var-get total-repaid),
+    platform-fee: (var-get platform-fee),
+    next-loan-id: (var-get next-loan-id)
+  }
+)
+
+;; Check if user can get loan
+(define-read-only (can-get-loan (user principal) (amount uint))
+  (match (calculate-credit-score user)
+    credit-score (ok (and 
+      (<= amount max-loan-amount)
+      (>= credit-score min-reputation-score)
+    ))
+    error (err error)
+  )
+)
+
+;; private functions
+
+;; Calculate interest rate based on credit score
+(define-private (calculate-interest-rate (credit-score uint))
+  (if (>= credit-score u800)
+    base-interest-rate
+    (if (>= credit-score u600)
+      (+ base-interest-rate u200)
+      (if (>= credit-score u400)
+        (+ base-interest-rate u400)
+        (+ base-interest-rate u600)
+      )
+    )
   )
 )
