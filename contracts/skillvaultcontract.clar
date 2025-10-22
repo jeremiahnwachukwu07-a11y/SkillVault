@@ -26,17 +26,24 @@
 (define-constant err-skill-verification-failed (err u106))
 (define-constant err-insufficient-reputation (err u107))
 (define-constant err-payment-failed (err u108))
+(define-constant err-overflow (err u109))
+(define-constant err-insufficient-funds (err u110))
+(define-constant err-loan-defaulted (err u111))
+(define-constant err-invalid-term (err u112))
 
 (define-constant max-loan-amount u1000000) ;; 1M microSTX
 (define-constant min-reputation-score u100)
 (define-constant skill-decay-rate u5) ;; 5% per period
 (define-constant base-interest-rate u500) ;; 5% in basis points
+(define-constant max-term-blocks u52560) ;; ~1 year
+(define-constant max-skill-score u10000) ;; Maximum total skill score
 
 ;; data vars
 (define-data-var next-loan-id uint u1)
 (define-data-var platform-fee uint u250) ;; 2.5% in basis points
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-repaid uint u0)
+(define-data-var paused bool false)
 
 ;; data maps
 (define-map user-profiles
@@ -72,6 +79,7 @@
     collateral-skills: (list 5 (string-ascii 50)),
     status: (string-ascii 20),
     created-at: uint,
+    due-at: uint,
     repaid-amount: uint,
     income-share-rate: uint
   }
@@ -126,12 +134,13 @@
   )
 )
 
-;; Register as skill oracle
-(define-public (register-oracle (skills-supported (list 10 (string-ascii 50))))
+;; Register as skill oracle (only contract owner can register oracles)
+(define-public (register-oracle (oracle principal) (skills-supported (list 10 (string-ascii 50))))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (asserts! (is-none (map-get? skill-oracles { oracle: oracle })) err-already-exists)
     (map-set skill-oracles
-      { oracle: tx-sender }
+      { oracle: oracle }
       {
         active: true,
         skills-supported: skills-supported,
@@ -142,11 +151,20 @@
   )
 )
 
-;; Add/verify skill through oracle
-(define-public (verify-skill (user principal) (skill-name (string-ascii 50)) (score uint) (oracle principal))
-  (let ((oracle-info (unwrap! (map-get? skill-oracles { oracle: oracle }) err-not-found)))
+;; Add/verify skill through oracle (only oracle can verify)
+(define-public (verify-skill (user principal) (skill-name (string-ascii 50)) (score uint))
+  (let (
+    (oracle tx-sender)
+    (oracle-info (unwrap! (map-get? skill-oracles { oracle: oracle }) err-unauthorized))
+    (profile (unwrap! (map-get? user-profiles { user: user }) err-not-found))
+    (current-skill-score (get skill-score profile))
+  )
     (asserts! (get active oracle-info) err-unauthorized)
     (asserts! (<= score u1000) err-invalid-input)
+    (asserts! (not (var-get paused)) err-unauthorized)
+    
+    ;; Check for overflow before adding
+    (asserts! (<= (+ current-skill-score score) max-skill-score) err-overflow)
     
     (map-set skills
       { user: user, skill-name: skill-name }
@@ -154,17 +172,18 @@
         score: score,
         verified: true,
         verifier: oracle,
-        verification-date: u0,
+        verification-date: stacks-block-height,
         decay-factor: u100
       }
     )
     
-    ;; Update user's total skill score
-    (let ((profile (unwrap! (map-get? user-profiles { user: user }) err-not-found)))
-      (map-set user-profiles
-        { user: user }
-        (merge profile { skill-score: (+ (get skill-score profile) score) })
-      )
+    ;; Update user's total skill score with overflow protection
+    (map-set user-profiles
+      { user: user }
+      (merge profile { 
+        skill-score: (+ current-skill-score score),
+        last-verification: stacks-block-height
+      })
     )
     (ok true)
   )
@@ -174,6 +193,11 @@
 (define-public (vouch-for-user (borrower principal) (skill-name (string-ascii 50)) (stake-amount uint))
   (let ((voucher tx-sender))
     (asserts! (> stake-amount u0) err-invalid-input)
+    (asserts! (not (is-eq voucher borrower)) err-invalid-input)
+    (asserts! (not (var-get paused)) err-unauthorized)
+    (asserts! (is-none (map-get? vouches { voucher: voucher, borrower: borrower })) err-already-exists)
+    
+    ;; Transfer stake to contract
     (try! (stx-transfer? stake-amount voucher (as-contract tx-sender)))
     
     (map-set vouches
@@ -184,6 +208,26 @@
         stake-amount: stake-amount,
         active: true
       }
+    )
+    (ok true)
+  )
+)
+
+;; Withdraw vouch stake
+(define-public (withdraw-vouch (borrower principal))
+  (let (
+    (voucher tx-sender)
+    (vouch-info (unwrap! (map-get? vouches { voucher: voucher, borrower: borrower }) err-not-found))
+  )
+    (asserts! (get active vouch-info) err-unauthorized)
+    
+    ;; Return stake to voucher
+    (try! (as-contract (stx-transfer? (get stake-amount vouch-info) tx-sender voucher)))
+    
+    ;; Mark vouch as inactive
+    (map-set vouches
+      { voucher: voucher, borrower: borrower }
+      (merge vouch-info { active: false })
     )
     (ok true)
   )
@@ -203,18 +247,35 @@
   )
 )
 
-;; Request loan
+;; Request loan with security checks
 (define-public (request-loan (amount uint) (term-blocks uint) (collateral-skills (list 5 (string-ascii 50))) (income-share-rate uint))
   (let (
     (borrower tx-sender)
     (loan-id (var-get next-loan-id))
     (credit-score (try! (calculate-credit-score borrower)))
     (interest-rate (calculate-interest-rate credit-score))
+    (profile (unwrap! (map-get? user-profiles { user: borrower }) err-not-found))
+    (due-block (+ stacks-block-height term-blocks))
   )
+    ;; Input validation
+    (asserts! (not (var-get paused)) err-unauthorized)
+    (asserts! (> amount u0) err-invalid-input)
     (asserts! (<= amount max-loan-amount) err-invalid-input)
+    (asserts! (> term-blocks u0) err-invalid-input)
+    (asserts! (<= term-blocks max-term-blocks) err-invalid-term)
     (asserts! (>= credit-score min-reputation-score) err-insufficient-reputation)
     (asserts! (<= income-share-rate u2000) err-invalid-input) ;; Max 20%
     
+    ;; Check contract has sufficient balance
+    (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) err-insufficient-funds)
+    
+    ;; Update borrower profile BEFORE transfer (checks-effects-interactions)
+    (map-set user-profiles
+      { user: borrower }
+      (merge profile { total-loans: (+ (get total-loans profile) u1) })
+    )
+    
+    ;; Create loan record
     (map-set loans
       { loan-id: loan-id }
       {
@@ -224,26 +285,19 @@
         term-blocks: term-blocks,
         collateral-skills: collateral-skills,
         status: "active",
-        created-at: u0,
+        created-at: stacks-block-height,
+        due-at: due-block,
         repaid-amount: u0,
         income-share-rate: income-share-rate
       }
     )
     
-    ;; Transfer loan amount to borrower
-    (try! (as-contract (stx-transfer? amount tx-sender borrower)))
-    
     ;; Update counters
     (var-set next-loan-id (+ loan-id u1))
     (var-set total-loans-issued (+ (var-get total-loans-issued) amount))
     
-    ;; Update borrower profile
-    (let ((profile (unwrap! (map-get? user-profiles { user: borrower }) err-not-found)))
-      (map-set user-profiles
-        { user: borrower }
-        (merge profile { total-loans: (+ (get total-loans profile) u1) })
-      )
-    )
+    ;; Transfer loan amount to borrower (last step)
+    (try! (as-contract (stx-transfer? amount tx-sender borrower)))
     
     (ok loan-id)
   )
@@ -254,40 +308,44 @@
   (let (
     (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
     (borrower (get borrower loan))
+    (profile (unwrap! (map-get? user-profiles { user: borrower }) err-not-found))
+    (new-repaid-amount (+ (get repaid-amount loan) payment-amount))
+    (total-due (+ (get amount loan) (/ (* (get amount loan) (get interest-rate loan)) u10000)))
   )
     (asserts! (is-eq tx-sender borrower) err-unauthorized)
     (asserts! (is-eq (get status loan) "active") err-loan-not-active)
+    (asserts! (> payment-amount u0) err-invalid-input)
     
+    ;; Transfer payment to contract
     (try! (stx-transfer? payment-amount borrower (as-contract tx-sender)))
     
     ;; Update loan repaid amount
     (map-set loans
       { loan-id: loan-id }
-      (merge loan { repaid-amount: (+ (get repaid-amount loan) payment-amount) })
+      (merge loan { repaid-amount: new-repaid-amount })
     )
     
     ;; Check if loan is fully repaid
-    (let ((total-due (+ (get amount loan) (/ (* (get amount loan) (get interest-rate loan)) u10000))))
-      (if (>= (+ (get repaid-amount loan) payment-amount) total-due)
-        (begin
-          (map-set loans { loan-id: loan-id } (merge loan { status: "repaid" }))
-          (var-set total-repaid (+ (var-get total-repaid) total-due))
-          
-          ;; Update borrower reputation
-          (let ((profile (unwrap! (map-get? user-profiles { user: borrower }) err-not-found)))
-            (map-set user-profiles
-              { user: borrower }
-              (merge profile { 
-                successful-repayments: (+ (get successful-repayments profile) u1),
-                reputation-score: (if (> (+ (get reputation-score profile) u10) u1000)
-                                      u1000
-                                      (+ (get reputation-score profile) u10))
-              })
-            )
-          )
+    (if (>= new-repaid-amount total-due)
+      (begin
+        (map-set loans { loan-id: loan-id } (merge loan { 
+          status: "repaid",
+          repaid-amount: new-repaid-amount
+        }))
+        (var-set total-repaid (+ (var-get total-repaid) total-due))
+        
+        ;; Update borrower reputation
+        (map-set user-profiles
+          { user: borrower }
+          (merge profile { 
+            successful-repayments: (+ (get successful-repayments profile) u1),
+            reputation-score: (if (> (+ (get reputation-score profile) u10) u1000)
+                                  u1000
+                                  (+ (get reputation-score profile) u10))
+          })
         )
-        true
       )
+      true
     )
     (ok true)
   )
@@ -295,8 +353,11 @@
 
 ;; Apply skill decay
 (define-public (apply-skill-decay (user principal) (skill-name (string-ascii 50)))
-  (let ((skill (unwrap! (map-get? skills { user: user, skill-name: skill-name }) err-not-found)))
-    (asserts! (> (- u0 (get verification-date skill)) u2016) err-invalid-input) ;; ~2 weeks
+  (let (
+    (skill (unwrap! (map-get? skills { user: user, skill-name: skill-name }) err-not-found))
+    (blocks-since-verification (- stacks-block-height (get verification-date skill)))
+  )
+    (asserts! (> blocks-since-verification u2016) err-invalid-input) ;; ~2 weeks
     
     (let ((decayed-score (/ (* (get score skill) (- u100 skill-decay-rate)) u100)))
       (map-set skills
@@ -307,6 +368,46 @@
         })
       )
     )
+    (ok true)
+  )
+)
+
+;; Mark loan as defaulted (only contract owner)
+(define-public (mark-loan-defaulted (loan-id uint))
+  (let (
+    (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-not-found))
+    (borrower (get borrower loan))
+    (profile (unwrap! (map-get? user-profiles { user: borrower }) err-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-not-active)
+    (asserts! (> stacks-block-height (get due-at loan)) err-invalid-input)
+    
+    ;; Mark loan as defaulted
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan { status: "defaulted" })
+    )
+    
+    ;; Penalize borrower reputation
+    (map-set user-profiles
+      { user: borrower }
+      (merge profile { 
+        reputation-score: (if (> (get reputation-score profile) u50)
+                              (- (get reputation-score profile) u50)
+                              u0),
+        is-active: false
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Emergency pause (only contract owner)
+(define-public (set-paused (paused-state bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (var-set paused paused-state)
     (ok true)
   )
 )
